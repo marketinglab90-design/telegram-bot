@@ -1,0 +1,42 @@
+const TOKEN = "YOUR_BOT_TOKEN";
+const URL = "https://api.telegram.org/bot" + TOKEN;
+
+function doPost(e) {
+  const contents = JSON.parse(e.postData.contents);
+
+  if (contents.message) {
+    const chatId = contents.message.chat.id;
+    const text = contents.message.text;
+
+    if (text === "/start") {
+      sendMessage(chatId, "Привет! Вот кнопка:", {
+        inline_keyboard: [
+          [{ text: "Нажми меня", callback_data: "pressed" }]
+        ]
+      });
+    }
+  }
+
+  if (contents.callback_query) {
+    const chatId = contents.callback_query.message.chat.id;
+
+    sendMessage(chatId, "Ты нажал кнопку!");
+  }
+}
+
+function sendMessage(chatId, text, keyboard = null) {
+  const payload = {
+    method: "sendMessage",
+    chat_id: String(chatId),
+    text: text,
+    reply_markup: keyboard
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload)
+  };
+
+  UrlFetchApp.fetch(URL + "/sendMessage", options);
+}
