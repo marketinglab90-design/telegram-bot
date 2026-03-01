@@ -17,7 +17,7 @@ bot.start((ctx) => {
 })
 
 // ===== 16:55 — отправка кнопки =====
-cron.schedule('00 17 * * *', async () => {
+cron.schedule('06 17 * * *', async () => {
   try {
     wasPressed = false
 
@@ -42,7 +42,7 @@ cron.schedule('00 17 * * *', async () => {
 
 
 // ===== 16:57 — удаление и сообщение о неуспехе =====
-cron.schedule('01 17 * * *', async () => {
+cron.schedule('07 17 * * *', async () => {
   try {
     if (!wasPressed && lastMessageId) {
 
