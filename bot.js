@@ -6,7 +6,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN)
 const app = express()
 
 // 👉 ВСТАВЬ СЮДА СВОЙ CHAT_ID
-const CHAT_ID = 123456789  // без кавычек
+const CHAT_ID = 653653812  // без кавычек
 
 let lastMessageId = null
 let wasPressed = false
