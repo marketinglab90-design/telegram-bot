@@ -5,54 +5,83 @@ const express = require('express')
 const bot = new Telegraf(process.env.BOT_TOKEN)
 const app = express()
 
-let lastMessageId = null
-const CHAT_ID = '653653812'
+// 👉 ВСТАВЬ СЮДА СВОЙ CHAT_ID
+const CHAT_ID = 123456789  // без кавычек
 
-// ===== КОМАНДА START =====
+let lastMessageId = null
+let wasPressed = false
+
+// ===== START =====
 bot.start((ctx) => {
   ctx.reply('Бот работает ✅')
 })
 
-// ===== 08:00 ОТПРАВКА =====
-cron.schedule('57 16 * * *', async () => {
+// ===== 16:55 — отправка кнопки =====
+cron.schedule('00 17 * * *', async () => {
   try {
+    wasPressed = false
+
     const message = await bot.telegram.sendMessage(
       CHAT_ID,
-      'У тебя 10 минут! Нажимай кнопку 👇',
+      'У тебя 2 минуты! Нажимай кнопку 👇',
       Markup.inlineKeyboard([
         Markup.button.callback('Успеть!', 'press')
       ])
     )
 
     lastMessageId = message.message_id
+    console.log('Сообщение отправлено')
+
   } catch (error) {
     console.log(error)
   }
+
+}, {
+  timezone: "Europe/Moscow"
 })
 
-// ===== 08:10 УДАЛЕНИЕ =====
-cron.schedule('58 16 * * *', async () => {
+
+// ===== 16:57 — удаление и сообщение о неуспехе =====
+cron.schedule('01 17 * * *', async () => {
   try {
-    if (lastMessageId) {
+    if (!wasPressed && lastMessageId) {
+
       await bot.telegram.deleteMessage(CHAT_ID, lastMessageId)
+
+      await bot.telegram.sendMessage(
+        CHAT_ID,
+        'Ты не успел, в следующий раз получится 😔'
+      )
+
+      console.log('Сообщение удалено, отправлено уведомление')
     }
 
-    await bot.telegram.sendMessage(
-      CHAT_ID,
-      'Ты не успел, в следующий раз получится 😔'
-    )
+  } catch (error) {
+    console.log(error)
+  }
+
+}, {
+  timezone: "Europe/Moscow"
+})
+
+
+// ===== НАЖАТИЕ КНОПКИ =====
+bot.action('press', async (ctx) => {
+  try {
+    wasPressed = true
+
+    await ctx.answerCbQuery()
+    await ctx.editMessageText('Ты успел! 🎉')
+
+    console.log('Кнопка нажата')
+
   } catch (error) {
     console.log(error)
   }
 })
 
-// ===== НАЖАТИЕ =====
-bot.action('press', async (ctx) => {
-  await ctx.answerCbQuery()
-  await ctx.reply('Ты успел! 🎉')
-})
 
-// ===== WEB SERVER (Railway требует) =====
+// ===== Web сервер (нужен для Railway) =====
 app.get('/', (req, res) => {
   res.send('Bot is running')
 })
