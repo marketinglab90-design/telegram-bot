@@ -14,7 +14,7 @@ bot.start((ctx) => {
 })
 
 // ===== 08:00 ОТПРАВКА =====
-cron.schedule('0 8 * * *', async () => {
+cron.schedule('57 16 * * *', async () => {
   try {
     const message = await bot.telegram.sendMessage(
       CHAT_ID,
@@ -31,7 +31,7 @@ cron.schedule('0 8 * * *', async () => {
 })
 
 // ===== 08:10 УДАЛЕНИЕ =====
-cron.schedule('10 8 * * *', async () => {
+cron.schedule('58 16 * * *', async () => {
   try {
     if (lastMessageId) {
       await bot.telegram.deleteMessage(CHAT_ID, lastMessageId)
