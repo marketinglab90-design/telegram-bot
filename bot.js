@@ -7,19 +7,13 @@ const path = require('path')
 const bot = new Telegraf(process.env.BOT_TOKEN)
 const app = express()
 
-// Твой chat id (личка)
+// твой chat id
 const CHAT_ID = 653653812
 
-// ====== Настройки расписания (Москва) ======
 const TZ = 'Europe/Moscow'
-const MAIN_TIME = '00 18 * * *'    // 16:55 отправка основной кнопки
-const MAIN_END = '02 18 * * *'     // 16:57 закрытие основной кнопки + запуск запасной
-const FALLBACK_END = '05 18 * * *' // 17:55 закрытие запасной (через 1 час после 16:55)
-const DAILY_REPORT = '59 23 * * *' // 23:59 отчёт за день
-
-// ====== Хранилище ======
 const DATA_FILE = path.join(__dirname, 'data.json')
 
+// ===== Хранилище очков =====
 function loadData() {
   try {
     if (!fs.existsSync(DATA_FILE)) return { days: {} }
@@ -28,32 +22,20 @@ function loadData() {
     return { days: {} }
   }
 }
-
 function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8')
 }
-
 function todayKey() {
   // YYYY-MM-DD по Москве
-  const d = new Date()
-  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(d)
-  return parts
+  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date())
 }
-
 function nowMsk() {
   return new Date().toLocaleString('ru-RU', { timeZone: TZ })
 }
-
 function ensureDay(data, day) {
-  if (!data.days[day]) {
-    data.days[day] = {
-      total: 0,
-      events: [] // [{time, type, points}]
-    }
-  }
+  if (!data.days[day]) data.days[day] = { total: 0, events: [] }
 }
-
-function addPoints(points, type) {
+function addPoints(points, taskId, taskName, kind) {
   const data = loadData()
   const day = todayKey()
   ensureDay(data, day)
@@ -61,7 +43,9 @@ function addPoints(points, type) {
   data.days[day].total += points
   data.days[day].events.push({
     time: nowMsk(),
-    type,
+    taskId,
+    taskName,
+    kind, // "main" | "fallback"
     points
   })
 
@@ -69,198 +53,241 @@ function addPoints(points, type) {
   return data.days[day].total
 }
 
-// ====== Состояние текущего дня (сообщения/окна) ======
-let mainMessageId = null
-let fallbackMessageId = null
+// ===== Конфиг привычек =====
+// cron формат: "минута час * * *"
+const TASKS = [
+  {
+    id: 'wake',
+    name: 'Подъём',
+    mainStart: '0 7 * * *',     // 07:00
+    mainEnd: '10 7 * * *',      // 07:10
+    fallbackEnd: '30 7 * * *',  // 07:30
+    mainPoints: 3,
+    fallbackPoints: 1,
+    mainBtn: '✅ Подъём (+3)',
+    fallbackBtn: '🟡 Подъём (+1)'
+  },
+  {
+    id: 'run',
+    name: 'Бег',
+    mainStart: '11 7 * * *',    // 07:11
+    mainEnd: '15 7 * * *',      // 07:15
+    fallbackEnd: '30 7 * * *',  // 07:30
+    mainPoints: 3,
+    fallbackPoints: 1,
+    mainBtn: '✅ Бег (+3)',
+    fallbackBtn: '🟡 Бег (+1)'
+  },
+  {
+    id: 'plan',
+    name: 'План на день',
+    mainStart: '0 8 * * *',     // 08:00
+    mainEnd: '20 8 * * *',      // 08:20
+    fallbackEnd: '0 9 * * *',   // 09:00
+    mainPoints: 3,
+    fallbackPoints: 1,
+    mainBtn: '✅ План (+3)',
+    fallbackBtn: '🟡 План (+1)'
+  },
+  {
+    id: 'report',
+    name: 'Отчёт',
+    mainStart: '0 22 * * *',     // 22:00
+    mainEnd: '30 22 * * *',      // 22:30
+    fallbackEnd: '0 23 * * *',   // 23:00
+    mainPoints: 3,
+    fallbackPoints: 1,
+    mainBtn: '✅ Отчёт (+3)',
+    fallbackBtn: '🟡 Отчёт (+1)'
+  }
+]
 
-let mainActive = false
-let fallbackActive = false
+// ===== Состояние по задачам (сообщения/окна) =====
+const state = Object.fromEntries(
+  TASKS.map(t => [t.id, {
+    mainActive: false,
+    fallbackActive: false,
+    mainPressed: false,
+    fallbackPressed: false,
+    mainMsgId: null,
+    fallbackMsgId: null
+  }])
+)
 
-let mainPressed = false
-let fallbackPressed = false
-
-function resetWindowsState() {
-  mainMessageId = null
-  fallbackMessageId = null
-  mainActive = false
-  fallbackActive = false
-  mainPressed = false
-  fallbackPressed = false
+function resetTaskWindow(taskId) {
+  state[taskId].mainActive = false
+  state[taskId].fallbackActive = false
+  state[taskId].mainPressed = false
+  state[taskId].fallbackPressed = false
+  state[taskId].mainMsgId = null
+  state[taskId].fallbackMsgId = null
 }
 
-// ====== Команды ======
-bot.start(async (ctx) => {
-  await ctx.reply('Бот работает ✅\nКоманды: /score — очки за сегодня')
-})
+// ===== Команды =====
+bot.start((ctx) => ctx.reply('Бот работает ✅\n/score — очки за сегодня'))
 
 bot.command('score', async (ctx) => {
   const data = loadData()
   const day = todayKey()
   const total = data.days?.[day]?.total ?? 0
-
   await ctx.reply(`Очки за сегодня (${day}): ${total}`)
 })
 
-// ====== Основная кнопка (3 балла) ======
-async function sendMainButton() {
-  console.log(`[CRON MAIN SEND] fired at MSK=${nowMsk()}`)
-
+// ===== Логика окон =====
+async function sendMain(task) {
+  console.log(`[${task.id}] MAIN START fired at MSK=${nowMsk()}`)
   try {
-    // новая попытка дня
-    resetWindowsState()
-    mainActive = true
+    resetTaskWindow(task.id)
+    state[task.id].mainActive = true
 
     const msg = await bot.telegram.sendMessage(
       CHAT_ID,
-      '⏱ У тебя 2 минуты! Нажимай кнопку 👇\n(за неё +3 балла)',
-      Markup.inlineKeyboard([Markup.button.callback('✅ Успеть (+3)', 'main_press')])
+      `⏱ ${task.name}\nНажми в основном окне — +${task.mainPoints}`,
+      Markup.inlineKeyboard([
+        Markup.button.callback(task.mainBtn, `main:${task.id}`)
+      ])
     )
-
-    mainMessageId = msg.message_id
-    console.log(`[CRON MAIN SEND] sent message_id=${mainMessageId}`)
+    state[task.id].mainMsgId = msg.message_id
   } catch (e) {
-    console.log('[CRON MAIN SEND] ERROR:', e)
+    console.log(`[${task.id}] MAIN START ERROR`, e)
   }
 }
 
-// ====== Закрыть основное окно; если не успел — показать запасную (1 балл) ======
-async function closeMainAndMaybeFallback() {
-  console.log(`[CRON MAIN CLOSE] fired at MSK=${nowMsk()}`)
-
+async function closeMain(task) {
+  console.log(`[${task.id}] MAIN END fired at MSK=${nowMsk()}`)
   try {
-    mainActive = false
+    state[task.id].mainActive = false
 
-    // если основное не нажато — удаляем сообщение и запускаем запасную кнопку
-    if (!mainPressed) {
-      if (mainMessageId) {
-        await bot.telegram.deleteMessage(CHAT_ID, mainMessageId).catch(() => {})
+    if (!state[task.id].mainPressed) {
+      // удалить основное сообщение
+      if (state[task.id].mainMsgId) {
+        await bot.telegram.deleteMessage(CHAT_ID, state[task.id].mainMsgId).catch(() => {})
       }
 
-      // включаем запасную на 1 час
-      fallbackActive = true
-
+      // показать запасную кнопку
+      state[task.id].fallbackActive = true
       const msg2 = await bot.telegram.sendMessage(
         CHAT_ID,
-        '❌ Ты не успел на +3.\nНо есть шанс в течение часа 👇 (+1 балл)',
-        Markup.inlineKeyboard([Markup.button.callback('🟡 Поздно, но засчитать (+1)', 'fallback_press')])
+        `❌ Не успел на +${task.mainPoints} (${task.name}).\nЕсть запасная кнопка — +${task.fallbackPoints} (активна до конца окна)`,
+        Markup.inlineKeyboard([
+          Markup.button.callback(task.fallbackBtn, `fb:${task.id}`)
+        ])
       )
-
-      fallbackMessageId = msg2.message_id
-      console.log(`[CRON FALLBACK SEND] sent message_id=${fallbackMessageId}`)
-    } else {
-      console.log('[CRON MAIN CLOSE] main was pressed, no fallback')
+      state[task.id].fallbackMsgId = msg2.message_id
     }
   } catch (e) {
-    console.log('[CRON MAIN CLOSE] ERROR:', e)
+    console.log(`[${task.id}] MAIN END ERROR`, e)
   }
 }
 
-// ====== Закрыть запасную кнопку через час ======
-async function closeFallbackWindow() {
-  console.log(`[CRON FALLBACK CLOSE] fired at MSK=${nowMsk()}`)
-
+async function closeFallback(task) {
+  console.log(`[${task.id}] FALLBACK END fired at MSK=${nowMsk()}`)
   try {
-    fallbackActive = false
+    state[task.id].fallbackActive = false
 
-    if (!fallbackPressed && fallbackMessageId) {
-      await bot.telegram.deleteMessage(CHAT_ID, fallbackMessageId).catch(() => {})
-      await bot.telegram.sendMessage(CHAT_ID, '⌛ Время вышло. Сегодняшняя попытка закрыта.')
-      console.log('[CRON FALLBACK CLOSE] fallback expired')
-    } else {
-      console.log('[CRON FALLBACK CLOSE] fallback was pressed or no message')
+    if (!state[task.id].fallbackPressed && state[task.id].fallbackMsgId) {
+      await bot.telegram.deleteMessage(CHAT_ID, state[task.id].fallbackMsgId).catch(() => {})
+      await bot.telegram.sendMessage(CHAT_ID, `⌛ ${task.name}: время вышло.`)
     }
   } catch (e) {
-    console.log('[CRON FALLBACK CLOSE] ERROR:', e)
+    console.log(`[${task.id}] FALLBACK END ERROR`, e)
   }
 }
 
-// ====== Нажатия ======
-bot.action('main_press', async (ctx) => {
+// ===== Обработчики нажатий =====
+bot.action(/^main:(.+)$/, async (ctx) => {
+  const taskId = ctx.match[1]
+  const task = TASKS.find(t => t.id === taskId)
+  if (!task) return
+
   try {
-    // защита от повторов/неактивного окна
-    if (!mainActive || mainPressed) {
-      await ctx.answerCbQuery('Уже неактуально 🙂', { show_alert: false })
+    if (!state[taskId].mainActive || state[taskId].mainPressed) {
+      await ctx.answerCbQuery('Уже неактуально 🙂')
       return
     }
 
-    mainPressed = true
-    mainActive = false
-    fallbackActive = false // запасная не нужна
+    state[taskId].mainPressed = true
+    state[taskId].mainActive = false
+    state[taskId].fallbackActive = false
 
-    const total = addPoints(3, 'main(+3)')
+    const total = addPoints(task.mainPoints, task.id, task.name, 'main')
+    await ctx.answerCbQuery(`+${task.mainPoints} ✅`)
+    await ctx.editMessageText(`✅ ${task.name} выполнено! +${task.mainPoints}\nСчёт за сегодня: ${total}`)
 
-    await ctx.answerCbQuery('Засчитано: +3 ✅')
-    // редактируем исходное сообщение с кнопкой
-    await ctx.editMessageText(`✅ Успел! +3 балла.\nТекущий счёт за сегодня: ${total}`)
-
-    // если вдруг уже была запасная — удалим
-    if (fallbackMessageId) {
-      await bot.telegram.deleteMessage(CHAT_ID, fallbackMessageId).catch(() => {})
-      fallbackMessageId = null
+    // если запасное сообщение вдруг уже было — удалим
+    if (state[taskId].fallbackMsgId) {
+      await bot.telegram.deleteMessage(CHAT_ID, state[taskId].fallbackMsgId).catch(() => {})
+      state[taskId].fallbackMsgId = null
     }
   } catch (e) {
-    console.log('[ACTION main_press] ERROR:', e)
+    console.log(`[${taskId}] ACTION main ERROR`, e)
   }
 })
 
-bot.action('fallback_press', async (ctx) => {
+bot.action(/^fb:(.+)$/, async (ctx) => {
+  const taskId = ctx.match[1]
+  const task = TASKS.find(t => t.id === taskId)
+  if (!task) return
+
   try {
-    // если запасная не активна — отказываем
-    if (!fallbackActive || fallbackPressed || mainPressed) {
-      await ctx.answerCbQuery('Уже неактуально 🙂', { show_alert: false })
+    if (!state[taskId].fallbackActive || state[taskId].fallbackPressed || state[taskId].mainPressed) {
+      await ctx.answerCbQuery('Уже неактуально 🙂')
       return
     }
 
-    fallbackPressed = true
-    fallbackActive = false
+    state[taskId].fallbackPressed = true
+    state[taskId].fallbackActive = false
 
-    const total = addPoints(1, 'fallback(+1)')
-
-    await ctx.answerCbQuery('Засчитано: +1 🟡')
-    await ctx.editMessageText(`🟡 Поздно, но засчитано: +1 балл.\nТекущий счёт за сегодня: ${total}`)
+    const total = addPoints(task.fallbackPoints, task.id, task.name, 'fallback')
+    await ctx.answerCbQuery(`+${task.fallbackPoints} 🟡`)
+    await ctx.editMessageText(`🟡 ${task.name} поздно, но зачтено: +${task.fallbackPoints}\nСчёт за сегодня: ${total}`)
   } catch (e) {
-    console.log('[ACTION fallback_press] ERROR:', e)
+    console.log(`[${taskId}] ACTION fb ERROR`, e)
   }
 })
 
-// ====== Отчёт в конце дня ======
-async function sendDailyReport() {
-  console.log(`[CRON DAILY REPORT] fired at MSK=${nowMsk()}`)
-
+// ===== Итог дня =====
+async function sendDailySummary() {
+  console.log(`[DAILY] SUMMARY fired at MSK=${nowMsk()}`)
   try {
     const data = loadData()
     const day = todayKey()
-    const dayData = data.days?.[day]
-    const total = dayData?.total ?? 0
-    const events = dayData?.events ?? []
+    const dayData = data.days?.[day] ?? { total: 0, events: [] }
 
-    let text = `📊 Итоги дня (${day}): ${total} баллов\n`
-    if (events.length) {
-      text += '\nСобытия:\n' + events.map(e => `• ${e.time} — ${e.type}: +${e.points}`).join('\n')
+    let text = `📊 Итоги дня (${day}): ${dayData.total} баллов\n`
+    if (dayData.events.length) {
+      // сгруппируем по привычкам
+      const byTask = {}
+      for (const e of dayData.events) {
+        const key = e.taskName
+        if (!byTask[key]) byTask[key] = 0
+        byTask[key] += e.points
+      }
+      text += '\nПо привычкам:\n' + Object.entries(byTask).map(([k, v]) => `• ${k}: ${v}`).join('\n')
     } else {
-      text += '\nСобытий не было.'
+      text += '\nСегодня без выполнений.'
     }
 
     await bot.telegram.sendMessage(CHAT_ID, text)
-
-    // после отчёта можно сбросить окна (на новый день)
-    resetWindowsState()
   } catch (e) {
-    console.log('[CRON DAILY REPORT] ERROR:', e)
+    console.log('[DAILY] ERROR', e)
   }
 }
 
-// ====== Cron расписания (Москва) ======
-cron.schedule(MAIN_TIME, sendMainButton, { timezone: TZ })
-cron.schedule(MAIN_END, closeMainAndMaybeFallback, { timezone: TZ })
-cron.schedule(FALLBACK_END, closeFallbackWindow, { timezone: TZ })
-cron.schedule(DAILY_REPORT, sendDailyReport, { timezone: TZ })
+// 23:05 МСК — итог дня
+cron.schedule('5 23 * * *', sendDailySummary, { timezone: TZ })
 
-// ====== Web server (Railway требует порт) ======
+// ===== Планировщики по задачам =====
+for (const task of TASKS) {
+  cron.schedule(task.mainStart, () => sendMain(task), { timezone: TZ })
+  cron.schedule(task.mainEnd, () => closeMain(task), { timezone: TZ })
+  cron.schedule(task.fallbackEnd, () => closeFallback(task), { timezone: TZ })
+}
+
+// ===== Web server (Railway) =====
 app.get('/', (req, res) => res.send('Bot is running'))
 app.listen(process.env.PORT || 3000, () => console.log('Server started'))
 
-// 409 защита при рестартах
 bot.launch({ dropPendingUpdates: true })
 
 process.once('SIGINT', () => bot.stop('SIGINT'))
