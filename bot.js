@@ -6,7 +6,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN)
 const app = express()
 
 let lastMessageId = null
-const CHAT_ID = 'ТУТ_ТВОЙ_CHAT_ID'
+const CHAT_ID = '653653812'
 
 // ===== КОМАНДА START =====
 bot.start((ctx) => {
