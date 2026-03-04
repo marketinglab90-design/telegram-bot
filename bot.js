@@ -1,24 +1,45 @@
+/**
+ * bot.js — Railway/GitHub ready
+ * ✅ Polling with webhook cleanup
+ * ✅ Handles 409 Conflict gracefully (keeps retrying)
+ * ✅ Single window per habit until 23:59 MSK, +3 only
+ * ✅ Positive reinforcement: milestones (1/3/5) + streak
+ * ✅ Daily summary (positive tone)
+ */
+
 const { Telegraf, Markup } = require('telegraf')
 const cron = require('node-cron')
 const express = require('express')
 const fs = require('fs')
 const path = require('path')
 
-const bot = new Telegraf(process.env.BOT_TOKEN)
-const app = express()
+// =====================
+// ENV / constants
+// =====================
+const BOT_TOKEN = (process.env.BOT_TOKEN || '').trim()
+const PORT = Number(process.env.PORT || 3000)
 
-// ====== ТВОЙ CHAT_ID (админ) ======
 const CHAT_ID = 653653812
-
-// ====== Часовой пояс ======
 const TZ = 'Europe/Moscow'
 
-// ====== Файлы ======
-const DATA_FILE = path.join(__dirname, 'data.json')     // очки
-const CONFIG_FILE = path.join(__dirname, 'config.json') // расписание/привычки
+const DAY_END = '23:59'
+const FIXED_POINTS = 3
+const PRAISE_MILESTONES = [1, 3, 5]
 
 // =====================
-// Утилиты времени
+// Files
+// =====================
+const DATA_FILE = path.join(__dirname, 'data.json')
+const CONFIG_FILE = path.join(__dirname, 'config.json')
+
+// =====================
+// Safety logs
+// =====================
+process.on('unhandledRejection', (reason) => console.error('UNHANDLED_REJECTION:', reason))
+process.on('uncaughtException', (err) => console.error('UNCAUGHT_EXCEPTION:', err))
+
+// =====================
+// Helpers: time
 // =====================
 function nowMsk() {
   return new Date().toLocaleString('ru-RU', { timeZone: TZ })
@@ -43,7 +64,7 @@ function isValidId(id) {
   return /^[a-z0-9_]{2,32}$/.test(id)
 }
 function decDay(dayStr) {
-  // dayStr: YYYY-MM-DD -> previous day (calendar), safe in UTC
+  // YYYY-MM-DD -> previous day (UTC safe)
   const [y, m, d] = dayStr.split('-').map(Number)
   const dt = new Date(Date.UTC(y, m - 1, d))
   dt.setUTCDate(dt.getUTCDate() - 1)
@@ -51,7 +72,7 @@ function decDay(dayStr) {
 }
 
 // =====================
-// Очки (data.json)
+// Data (points / events / praise)
 // =====================
 function loadData() {
   try {
@@ -65,13 +86,14 @@ function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8')
 }
 function ensureDay(data, day) {
+  if (!data.days) data.days = {}
   if (!data.days[day]) {
     data.days[day] = { total: 0, events: [], praise: { countsSent: [] } }
-  } else {
-    if (!data.days[day].events) data.days[day].events = []
-    if (!data.days[day].praise) data.days[day].praise = { countsSent: [] }
-    if (!Array.isArray(data.days[day].praise.countsSent)) data.days[day].praise.countsSent = []
+    return
   }
+  if (!Array.isArray(data.days[day].events)) data.days[day].events = []
+  if (!data.days[day].praise) data.days[day].praise = { countsSent: [] }
+  if (!Array.isArray(data.days[day].praise.countsSent)) data.days[day].praise.countsSent = []
 }
 function addPoints(points, taskId, taskName) {
   const data = loadData()
@@ -96,7 +118,7 @@ function addPoints(points, taskId, taskName) {
   }
 }
 function calcStreak(data, day) {
-  // Стрик: количество подряд идущих дней (включая today), где есть хотя бы 1 событие
+  // consecutive days including day with at least 1 event
   let streak = 0
   let cur = day
   for (let i = 0; i < 3660; i++) {
@@ -109,7 +131,7 @@ function calcStreak(data, day) {
 }
 
 // =====================
-// Конфиг (config.json)
+// Config (habits schedule)
 // =====================
 const DEFAULT_CONFIG = {
   summaryTime: '23:59',
@@ -121,26 +143,29 @@ const DEFAULT_CONFIG = {
   ]
 }
 
+function clone(obj) {
+  // Node 22 has structuredClone, but keep safe
+  return JSON.parse(JSON.stringify(obj))
+}
+
 function loadConfig() {
   try {
     if (!fs.existsSync(CONFIG_FILE)) {
       fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), 'utf-8')
-      return structuredClone(DEFAULT_CONFIG)
+      return clone(DEFAULT_CONFIG)
     }
     const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
-    if (!cfg || !Array.isArray(cfg.tasks)) return structuredClone(DEFAULT_CONFIG)
+    if (!cfg || !Array.isArray(cfg.tasks)) return clone(DEFAULT_CONFIG)
     if (!cfg.summaryTime) cfg.summaryTime = DEFAULT_CONFIG.summaryTime
 
-    // миграция со старого формата: оставим start/id/name
-    cfg.tasks = cfg.tasks.map(t => ({
-      id: t.id,
-      name: t.name,
-      start: t.start
-    })).filter(t => t?.id && t?.name && t?.start)
+    // normalize tasks
+    cfg.tasks = cfg.tasks
+      .map(t => ({ id: t.id, name: t.name, start: t.start }))
+      .filter(t => t?.id && t?.name && t?.start)
 
     return cfg
   } catch {
-    return structuredClone(DEFAULT_CONFIG)
+    return clone(DEFAULT_CONFIG)
   }
 }
 function saveConfig(cfg) {
@@ -150,13 +175,25 @@ function saveConfig(cfg) {
 let config = loadConfig()
 
 // =====================
-// Состояние по задачам
+// Telegraf init
+// =====================
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN is missing. Set it in Railway Variables and redeploy.')
+  process.exit(1)
+}
+
+const bot = new Telegraf(BOT_TOKEN)
+
+bot.catch((err, ctx) => {
+  console.error('TELEGRAF_ERROR:', err, 'update:', ctx?.update)
+})
+
+// =====================
+// State: active buttons until 23:59
 // =====================
 const state = {} // taskId -> { active, pressed, msgId }
 function ensureTaskState(taskId) {
-  if (!state[taskId]) {
-    state[taskId] = { active: false, pressed: false, msgId: null }
-  }
+  if (!state[taskId]) state[taskId] = { active: false, pressed: false, msgId: null }
 }
 function resetTaskWindow(taskId) {
   ensureTaskState(taskId)
@@ -166,7 +203,7 @@ function resetTaskWindow(taskId) {
 }
 
 // =====================
-// Cron jobs (динамически)
+// Cron jobs
 // =====================
 const jobs = []
 function stopAllJobs() {
@@ -175,9 +212,6 @@ function stopAllJobs() {
     try { j.stop() } catch {}
   }
 }
-
-const DAY_END = '23:59'
-const FIXED_POINTS = 3
 
 function taskButton(task) {
   return `✅ ${task.name} (+${FIXED_POINTS})`
@@ -190,26 +224,24 @@ async function sendTask(task) {
     resetTaskWindow(task.id)
     state[task.id].active = true
 
-    const btn = taskButton(task)
-
     const msg = await bot.telegram.sendMessage(
       CHAT_ID,
       `🌟 ${task.name}\nНажми кнопку, когда сделаешь — и получишь +${FIXED_POINTS}.\nОкно сегодня до ${DAY_END} (МСК).`,
-      Markup.inlineKeyboard([Markup.button.callback(btn, `done:${task.id}`)])
+      Markup.inlineKeyboard([Markup.button.callback(taskButton(task), `done:${task.id}`)])
     )
+
     state[task.id].msgId = msg.message_id
   } catch (e) {
-    console.log(`[${task.id}] SEND ERROR`, e)
+    console.error(`[${task.id}] SEND ERROR`, e)
   }
 }
 
-// Тихо закрываем окна в конце дня (без сообщений)
+// Quietly close all windows at end of day (no negative messages)
 async function closeAllAtDayEnd() {
   console.log(`[DAY] CLOSE windows fired at MSK=${nowMsk()}`)
   try {
     for (const task of config.tasks) {
       ensureTaskState(task.id)
-
       state[task.id].active = false
 
       if (!state[task.id].pressed && state[task.id].msgId) {
@@ -218,20 +250,16 @@ async function closeAllAtDayEnd() {
       state[task.id].msgId = null
     }
   } catch (e) {
-    console.log('[DAY] CLOSE ERROR', e)
+    console.error('[DAY] CLOSE ERROR', e)
   }
 }
 
-// =====================
-// Позитивное подкрепление (стрик + вехи)
-// =====================
-const PRAISE_MILESTONES = [1, 3, 5]
-
+// Positive reinforcement
 function pickPraise(count, streak) {
   const variants = [
     `🔥 Есть! Это ${count}-я отметка сегодня. Серия: ${streak} дн. Продолжаем!`,
-    `✨ Классно сделано. Сегодня уже ${count}. Серия: ${streak} дн.`,
-    `💪 Сила привычки! ${count} выполнено сегодня. Серия: ${streak} дн.`,
+    `✨ Классно! Сегодня уже ${count}. Серия: ${streak} дн.`,
+    `💪 Сила привычки: ${count} выполнено сегодня. Серия: ${streak} дн.`,
     `🏅 Отличный темп: ${count} за день. Серия: ${streak} дн.`
   ]
   return variants[Math.floor(Math.random() * variants.length)]
@@ -242,10 +270,8 @@ async function maybeSendPraise(day, totalCount, data) {
   const sent = data.days[day].praise.countsSent
 
   if (!PRAISE_MILESTONES.includes(totalCount)) return
-
   if (sent.includes(totalCount)) return
 
-  // отметим, что отправили, чтобы не спамить
   sent.push(totalCount)
   saveData(data)
 
@@ -275,9 +301,7 @@ async function sendDailySummary() {
       }
 
       text += '\n🏅 Сегодня отмечено:\n' +
-        Object.entries(byTask)
-          .map(([k, v]) => `• ${k}: +${v}`)
-          .join('\n')
+        Object.entries(byTask).map(([k, v]) => `• ${k}: +${v}`).join('\n')
 
       text += '\n\n🧾 Лента отметок:\n' +
         dayData.events.map(e => `• ${e.time} — ${e.taskName}: +${e.points}`).join('\n')
@@ -289,7 +313,7 @@ async function sendDailySummary() {
 
     await bot.telegram.sendMessage(CHAT_ID, text)
   } catch (e) {
-    console.log('[DAILY] ERROR', e)
+    console.error('[DAILY] ERROR', e)
   }
 }
 
@@ -317,14 +341,14 @@ function scheduleAllFromConfig() {
 }
 
 // =====================
-// Админ-доступ
+// Admin check
 // =====================
 function isAdmin(ctx) {
   return ctx?.chat?.id === CHAT_ID
 }
 
 // =====================
-// Команды
+// Commands (positive)
 // =====================
 bot.start((ctx) => ctx.reply(
   'Бот работает ✅\n\n' +
@@ -352,7 +376,7 @@ bot.command('score', async (ctx) => {
 
 bot.command('habits', async (ctx) => {
   const lines = []
-  lines.push(`🗓 Расписание (МСК). Окна привычек: с времени старта и до ${DAY_END}. Итог дня: ${config.summaryTime}`)
+  lines.push(`🗓 Расписание (МСК). Окна привычек: со старта и до ${DAY_END}. Итог дня: ${config.summaryTime}`)
   for (const t of config.tasks) {
     lines.push(`• ${t.id} — ${t.name}: старт ${t.start} | +${FIXED_POINTS}`)
   }
@@ -364,19 +388,16 @@ bot.command('set', async (ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('Нет доступа 🙂')
 
   const parts = (ctx.message.text || '').trim().split(/\s+/)
-  if (parts.length !== 3) {
-    return ctx.reply('Формат: /set <id> <start>\nПример: /set wake 07:00')
-  }
+  if (parts.length !== 3) return ctx.reply('Формат: /set <id> <start>\nПример: /set wake 07:00')
+
   const [, id, start] = parts
   const task = config.tasks.find(t => t.id === id)
   if (!task) return ctx.reply(`Не нашёл id="${id}". Смотри /habits`)
-
   if (!parseHHMM(start)) return ctx.reply('Неверный формат времени. Нужно HH:MM (например 07:05).')
 
   task.start = start
   saveConfig(config)
   scheduleAllFromConfig()
-
   await ctx.reply(`✅ Обновил: ${task.name}. Старт ${start}, окно до ${DAY_END}`)
 })
 
@@ -390,15 +411,14 @@ bot.command('rename', async (ctx) => {
 
   const id = m[1]
   const newName = m[2].trim()
-  const task = config.tasks.find(t => t.id === id)
 
+  const task = config.tasks.find(t => t.id === id)
   if (!task) return ctx.reply(`Не нашёл id="${id}". Смотри /habits`)
   if (newName.length < 2 || newName.length > 60) return ctx.reply('Название должно быть 2..60 символов.')
 
   task.name = newName
   saveConfig(config)
   scheduleAllFromConfig()
-
   await ctx.reply(`✅ Переименовал: ${id} — ${newName}`)
 })
 
@@ -418,7 +438,6 @@ bot.command('add', async (ctx) => {
 
   const left = parts[0].trim().split(/\s+/)
   const name = parts[1].trim()
-
   if (left.length !== 2) return ctx.reply('Слева должно быть 2 аргумента: <id> <start>')
 
   const [id, start] = left
@@ -470,22 +489,20 @@ bot.command('setsummary', async (ctx) => {
   config.summaryTime = time
   saveConfig(config)
   scheduleAllFromConfig()
-
   await ctx.reply(`✅ Итог дня теперь в ${time} (МСК)`)
 })
 
 // /reset
 bot.command('reset', async (ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('Нет доступа 🙂')
-
-  config = structuredClone(DEFAULT_CONFIG)
+  config = clone(DEFAULT_CONFIG)
   saveConfig(config)
   scheduleAllFromConfig()
   await ctx.reply('✅ Конфиг сброшен на дефолтный.')
 })
 
 // =====================
-// Нажатия кнопок
+// Button actions
 // =====================
 bot.action(/^done:(.+)$/, async (ctx) => {
   const taskId = ctx.match[1]
@@ -510,22 +527,80 @@ bot.action(/^done:(.+)$/, async (ctx) => {
       `✅ ${task.name} — супер!\n+${FIXED_POINTS} балла в копилку ✨\nСчёт за сегодня: ${total}`
     )
 
-    // Похвала за вехи + стрик (без негатива)
     await maybeSendPraise(day, count, data)
   } catch (e) {
-    console.log(`[${taskId}] ACTION done ERROR`, e)
+    console.error(`[${taskId}] ACTION done ERROR`, e)
   }
 })
 
 // =====================
-// Web server (Railway)
+// Express server (Railway health)
 // =====================
-app.get('/', (req, res) => res.send('Bot is running'))
-app.listen(process.env.PORT || 3000, () => console.log('Server started'))
+const app = express()
+app.get('/', (req, res) => res.status(200).send('Bot is running'))
+app.get('/health', (req, res) => res.status(200).json({ ok: true, time: nowMsk() }))
+app.listen(PORT, () => console.log('✅ Server started on', PORT))
 
-// старт
-scheduleAllFromConfig()
-bot.launch({ dropPendingUpdates: true })
+// =====================
+// Robust start (no more silent failures)
+// =====================
+let stopping = false
 
-process.once('SIGINT', () => bot.stop('SIGINT'))
-process.once('SIGTERM', () => bot.stop('SIGTERM'))
+async function startPollingLoop() {
+  // This loop prevents "dead green" deploys:
+  // if Telegram returns 409, we keep retrying and logging.
+  let attempt = 0
+
+  while (!stopping) {
+    attempt += 1
+    try {
+      console.log(`\n=== BOOT attempt #${attempt} @ MSK=${nowMsk()} ===`)
+
+      // If webhook exists — remove it (polling mode)
+      try {
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true })
+        console.log('✅ deleteWebhook OK (polling mode)')
+      } catch (e) {
+        console.warn('⚠️ deleteWebhook failed (can be ok):', e?.message || e)
+      }
+
+      // Token sanity check
+      const me = await bot.telegram.getMe()
+      console.log('✅ Bot identity:', me.username, me.id)
+
+      scheduleAllFromConfig()
+
+      await bot.launch({
+        dropPendingUpdates: true,
+        allowedUpdates: ['message', 'callback_query']
+      })
+
+      console.log('✅ Bot launched (polling).')
+      return // success: exit loop
+
+    } catch (err) {
+      const msg = err?.message || String(err)
+      console.error('❌ Bot launch error:', msg)
+
+      // 409 means another instance is polling; can't fix in code,
+      // but we can keep retrying so it self-recovers when other instance stops.
+      const is409 =
+        msg.includes('409') ||
+        msg.toLowerCase().includes('conflict') ||
+        (err?.response?.error_code === 409)
+
+      // Stop any partially started polling
+      try { bot.stop('launch_error') } catch {}
+
+      const waitMs = is409 ? 15000 : 5000
+      console.log(`⏳ Retry in ${Math.round(waitMs / 1000)}s... (hint: stop other bot instances)`)
+      await new Promise(r => setTimeout(r, waitMs))
+    }
+  }
+}
+
+startPollingLoop()
+
+// Graceful shutdown
+process.once('SIGINT', () => { stopping = true; bot.stop('SIGINT') })
+process.once('SIGTERM', () => { stopping = true; bot.stop('SIGTERM') })
