@@ -40,8 +40,14 @@ function toCron(hhmm) {
   return `${t.mm} ${t.hh} * * *`
 }
 function isValidId(id) {
-  // латиница/цифры/underscore, 2..32
   return /^[a-z0-9_]{2,32}$/.test(id)
+}
+function decDay(dayStr) {
+  // dayStr: YYYY-MM-DD -> previous day (calendar), safe in UTC
+  const [y, m, d] = dayStr.split('-').map(Number)
+  const dt = new Date(Date.UTC(y, m - 1, d))
+  dt.setUTCDate(dt.getUTCDate() - 1)
+  return dt.toISOString().slice(0, 10)
 }
 
 // =====================
@@ -59,7 +65,13 @@ function saveData(data) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8')
 }
 function ensureDay(data, day) {
-  if (!data.days[day]) data.days[day] = { total: 0, events: [] }
+  if (!data.days[day]) {
+    data.days[day] = { total: 0, events: [], praise: { countsSent: [] } }
+  } else {
+    if (!data.days[day].events) data.days[day].events = []
+    if (!data.days[day].praise) data.days[day].praise = { countsSent: [] }
+    if (!Array.isArray(data.days[day].praise.countsSent)) data.days[day].praise.countsSent = []
+  }
 }
 function addPoints(points, taskId, taskName) {
   const data = loadData()
@@ -75,14 +87,31 @@ function addPoints(points, taskId, taskName) {
   })
 
   saveData(data)
-  return data.days[day].total
+
+  return {
+    day,
+    total: data.days[day].total,
+    count: data.days[day].events.length,
+    data
+  }
+}
+function calcStreak(data, day) {
+  // Стрик: количество подряд идущих дней (включая today), где есть хотя бы 1 событие
+  let streak = 0
+  let cur = day
+  for (let i = 0; i < 3660; i++) {
+    const dd = data.days?.[cur]
+    if (!dd || !dd.events || dd.events.length === 0) break
+    streak += 1
+    cur = decDay(cur)
+  }
+  return streak
 }
 
 // =====================
 // Конфиг (config.json)
 // =====================
 const DEFAULT_CONFIG = {
-  // Итог дня (можно поменять /setsummary)
   summaryTime: '23:59',
   tasks: [
     { id: 'wake', name: 'Подъём', start: '07:00' },
@@ -102,7 +131,7 @@ function loadConfig() {
     if (!cfg || !Array.isArray(cfg.tasks)) return structuredClone(DEFAULT_CONFIG)
     if (!cfg.summaryTime) cfg.summaryTime = DEFAULT_CONFIG.summaryTime
 
-    // миграция со старого формата: оставим start/id/name, остальное игнорируем
+    // миграция со старого формата: оставим start/id/name
     cfg.tasks = cfg.tasks.map(t => ({
       id: t.id,
       name: t.name,
@@ -121,16 +150,12 @@ function saveConfig(cfg) {
 let config = loadConfig()
 
 // =====================
-// Состояние по задачам (кнопки активны до 23:59)
+// Состояние по задачам
 // =====================
-const state = {} // taskId -> state
+const state = {} // taskId -> { active, pressed, msgId }
 function ensureTaskState(taskId) {
   if (!state[taskId]) {
-    state[taskId] = {
-      active: false,
-      pressed: false,
-      msgId: null
-    }
+    state[taskId] = { active: false, pressed: false, msgId: null }
   }
 }
 function resetTaskWindow(taskId) {
@@ -162,7 +187,6 @@ async function sendTask(task) {
   ensureTaskState(task.id)
   console.log(`[${task.id}] SEND fired at MSK=${nowMsk()} (start=${task.start}, window->${DAY_END})`)
   try {
-    // новое окно на день
     resetTaskWindow(task.id)
     state[task.id].active = true
 
@@ -179,7 +203,7 @@ async function sendTask(task) {
   }
 }
 
-// Тихо закрываем окна в конце дня (без негатива)
+// Тихо закрываем окна в конце дня (без сообщений)
 async function closeAllAtDayEnd() {
   console.log(`[DAY] CLOSE windows fired at MSK=${nowMsk()}`)
   try {
@@ -191,13 +215,43 @@ async function closeAllAtDayEnd() {
       if (!state[task.id].pressed && state[task.id].msgId) {
         await bot.telegram.deleteMessage(CHAT_ID, state[task.id].msgId).catch(() => {})
       }
-
-      // сбросим msgId чтобы не пытаться удалять повторно
       state[task.id].msgId = null
     }
   } catch (e) {
     console.log('[DAY] CLOSE ERROR', e)
   }
+}
+
+// =====================
+// Позитивное подкрепление (стрик + вехи)
+// =====================
+const PRAISE_MILESTONES = [1, 3, 5]
+
+function pickPraise(count, streak) {
+  const variants = [
+    `🔥 Есть! Это ${count}-я отметка сегодня. Серия: ${streak} дн. Продолжаем!`,
+    `✨ Классно сделано. Сегодня уже ${count}. Серия: ${streak} дн.`,
+    `💪 Сила привычки! ${count} выполнено сегодня. Серия: ${streak} дн.`,
+    `🏅 Отличный темп: ${count} за день. Серия: ${streak} дн.`
+  ]
+  return variants[Math.floor(Math.random() * variants.length)]
+}
+
+async function maybeSendPraise(day, totalCount, data) {
+  ensureDay(data, day)
+  const sent = data.days[day].praise.countsSent
+
+  if (!PRAISE_MILESTONES.includes(totalCount)) return
+
+  if (sent.includes(totalCount)) return
+
+  // отметим, что отправили, чтобы не спамить
+  sent.push(totalCount)
+  saveData(data)
+
+  const streak = calcStreak(data, day)
+  const text = pickPraise(totalCount, streak)
+  await bot.telegram.sendMessage(CHAT_ID, text).catch(() => {})
 }
 
 async function sendDailySummary() {
@@ -207,9 +261,14 @@ async function sendDailySummary() {
     const day = todayKey()
     const dayData = data.days?.[day] ?? { total: 0, events: [] }
 
-    let text = `📊 Итоги дня (${day}): ${dayData.total} баллов ✨\n`
+    const streak = calcStreak(data, day)
+    const count = dayData.events?.length ?? 0
 
-    if (dayData.events.length) {
+    let text = `📊 Итоги дня (${day}): ${dayData.total} баллов ✨\n`
+    text += `✅ Отметок: ${count}\n`
+    text += `🔁 Серия дней: ${streak}\n`
+
+    if (count) {
       const byTask = {}
       for (const e of dayData.events) {
         byTask[e.taskName] = (byTask[e.taskName] || 0) + e.points
@@ -223,9 +282,9 @@ async function sendDailySummary() {
       text += '\n\n🧾 Лента отметок:\n' +
         dayData.events.map(e => `• ${e.time} — ${e.taskName}: +${e.points}`).join('\n')
 
-      text += '\n\n🔥 Красавчик. Маленькие шаги — большие изменения.'
+      text += '\n\n🔥 Ты молодец. Завтра — ещё проще.'
     } else {
-      text += '\nСегодня без отметок — ничего страшного.\nЗавтра снова в игру 💪'
+      text += '\nТихий день — тоже часть пути.\nЗавтра начнём с малого и нарастим 💪'
     }
 
     await bot.telegram.sendMessage(CHAT_ID, text)
@@ -237,32 +296,22 @@ async function sendDailySummary() {
 function scheduleAllFromConfig() {
   stopAllJobs()
 
-  // задачи
   for (const task of config.tasks) {
     ensureTaskState(task.id)
-
     const cStart = toCron(task.start)
     if (!cStart) {
       console.log(`[SCHED] invalid time format for ${task.id}`)
       continue
     }
-
     jobs.push(cron.schedule(cStart, () => sendTask(task), { timezone: TZ }))
   }
 
-  // закрытие всех окон в конце дня (тихо)
   const endCron = toCron(DAY_END)
-  if (endCron) {
-    jobs.push(cron.schedule(endCron, closeAllAtDayEnd, { timezone: TZ }))
-  }
+  if (endCron) jobs.push(cron.schedule(endCron, closeAllAtDayEnd, { timezone: TZ }))
 
-  // итог дня
   const sumCron = toCron(config.summaryTime)
-  if (sumCron) {
-    jobs.push(cron.schedule(sumCron, sendDailySummary, { timezone: TZ }))
-  } else {
-    console.log('[SCHED] invalid summaryTime:', config.summaryTime)
-  }
+  if (sumCron) jobs.push(cron.schedule(sumCron, sendDailySummary, { timezone: TZ }))
+  else console.log('[SCHED] invalid summaryTime:', config.summaryTime)
 
   console.log(`[SCHED] rescheduled: tasks=${config.tasks.length}, dayEnd=${DAY_END}, summary=${config.summaryTime}, MSK=${nowMsk()}`)
 }
@@ -279,7 +328,8 @@ function isAdmin(ctx) {
 // =====================
 bot.start((ctx) => ctx.reply(
   'Бот работает ✅\n\n' +
-  'Смысл: позитивные отметки привычек (+3), без негатива.\n\n' +
+  'Смысл: позитивные отметки привычек (+3), без негатива.\n' +
+  'Есть похвала за вехи (1/3/5 отметок) и серия дней.\n\n' +
   'Команды:\n' +
   '/habits — список привычек\n' +
   '/score — очки за сегодня\n' +
@@ -295,7 +345,9 @@ bot.command('score', async (ctx) => {
   const data = loadData()
   const day = todayKey()
   const total = data.days?.[day]?.total ?? 0
-  await ctx.reply(`Очки за сегодня (${day}): ${total}`)
+  const count = data.days?.[day]?.events?.length ?? 0
+  const streak = calcStreak(data, day)
+  await ctx.reply(`Сегодня (${day}): ${total} баллов ✨ | отметок: ${count} | серия: ${streak} дн.`)
 })
 
 bot.command('habits', async (ctx) => {
@@ -319,12 +371,9 @@ bot.command('set', async (ctx) => {
   const task = config.tasks.find(t => t.id === id)
   if (!task) return ctx.reply(`Не нашёл id="${id}". Смотри /habits`)
 
-  if (!parseHHMM(start)) {
-    return ctx.reply('Неверный формат времени. Нужно HH:MM (например 07:05).')
-  }
+  if (!parseHHMM(start)) return ctx.reply('Неверный формат времени. Нужно HH:MM (например 07:05).')
 
   task.start = start
-
   saveConfig(config)
   scheduleAllFromConfig()
 
@@ -341,8 +390,8 @@ bot.command('rename', async (ctx) => {
 
   const id = m[1]
   const newName = m[2].trim()
-
   const task = config.tasks.find(t => t.id === id)
+
   if (!task) return ctx.reply(`Не нашёл id="${id}". Смотри /habits`)
   if (newName.length < 2 || newName.length > 60) return ctx.reply('Название должно быть 2..60 символов.')
 
@@ -364,29 +413,21 @@ bot.command('add', async (ctx) => {
   const rest = m[1]
   const parts = rest.split('|')
   if (parts.length !== 2) {
-    return ctx.reply('Формат: /add <id> <start> | <name...>\n' +
-      'Пример: /add water 10:00 | Стакан воды')
+    return ctx.reply('Формат: /add <id> <start> | <name...>\nПример: /add water 10:00 | Стакан воды')
   }
 
   const left = parts[0].trim().split(/\s+/)
   const name = parts[1].trim()
 
-  if (left.length !== 2) {
-    return ctx.reply('Слева должно быть 2 аргумента: <id> <start>')
-  }
+  if (left.length !== 2) return ctx.reply('Слева должно быть 2 аргумента: <id> <start>')
 
   const [id, start] = left
-
   if (!isValidId(id)) return ctx.reply('id должен быть латиницей/цифрами/underscore, 2..32 символа. Пример: water_1')
   if (config.tasks.some(t => t.id === id)) return ctx.reply(`id "${id}" уже существует.`)
-
-  if (!parseHHMM(start)) {
-    return ctx.reply('Неверный формат времени. Нужно HH:MM (например 10:05).')
-  }
+  if (!parseHHMM(start)) return ctx.reply('Неверный формат времени. Нужно HH:MM (например 10:05).')
   if (name.length < 2 || name.length > 60) return ctx.reply('Название должно быть 2..60 символов.')
 
   config.tasks.push({ id, name, start })
-
   saveConfig(config)
   scheduleAllFromConfig()
 
@@ -407,7 +448,6 @@ bot.command('del', async (ctx) => {
   const removed = config.tasks.splice(idx, 1)[0]
   saveConfig(config)
 
-  // подчистим сообщение, если висит
   if (state[id]) {
     if (state[id].msgId) await bot.telegram.deleteMessage(CHAT_ID, state[id].msgId).catch(() => {})
     delete state[id]
@@ -463,12 +503,15 @@ bot.action(/^done:(.+)$/, async (ctx) => {
     state[taskId].pressed = true
     state[taskId].active = false
 
-    const total = addPoints(FIXED_POINTS, task.id, task.name)
-    await ctx.answerCbQuery(`+${FIXED_POINTS} ✅`)
+    const { day, total, count, data } = addPoints(FIXED_POINTS, task.id, task.name)
 
+    await ctx.answerCbQuery(`+${FIXED_POINTS} ✅`)
     await ctx.editMessageText(
       `✅ ${task.name} — супер!\n+${FIXED_POINTS} балла в копилку ✨\nСчёт за сегодня: ${total}`
     )
+
+    // Похвала за вехи + стрик (без негатива)
+    await maybeSendPraise(day, count, data)
   } catch (e) {
     console.log(`[${taskId}] ACTION done ERROR`, e)
   }
